@@ -1,4 +1,5 @@
 import React from "react";
+import { isDirectory, isFile, newDirectory, newFile, readFromDisk, ROOT_DIR, walkFS, writeToDisk } from "./file-system";
 import "./App.css";
 
 type MemoryItem = {
@@ -6,11 +7,29 @@ type MemoryItem = {
 	content: string;
 };
 
+const inputMemoryLocalStorageKey = "inputMemory";
+
 export function App() {
 	const [memory, setMemory] = React.useState<MemoryItem[]>([]);
-	const [inputMemory, setInputMemory] = React.useState<string[]>([]);
+	const [inputMemory, setInputMemory] = React.useState<string[]>(() => {
+		const raw = localStorage.getItem(inputMemoryLocalStorageKey);
+		if (!raw) {
+			return [];
+		}
+		try {
+			return JSON.parse(raw);
+		} catch {
+			return [];
+		}
+	});
+	React.useEffect(() => {
+		localStorage.setItem(inputMemoryLocalStorageKey, JSON.stringify(inputMemory));
+	}, [inputMemory]);
 	const [isRunning, setIsRunning] = React.useState(false);
 	const [queue, setQueue] = React.useState<string[]>([]);
+
+	const fileSystemRef = useLazyRef(() => readFromDisk() || newDirectory(""));
+	const [workingDirectory] = walkFS(fileSystemRef.current, window.location.pathname);
 
 	async function onRun(raw: string) {
 		setQueue((prev) => [...prev, raw]);
@@ -27,7 +46,7 @@ export function App() {
 	async function run(raw: string) {
 		setMemory((prev) => [...prev, { type: "input", content: raw }]);
 		setInputMemory((prev) => {
-			if (prev.length > 0 && prev.at(-1) === raw) {
+			if (raw === "" || (prev.length > 0 && prev.at(-1) === raw)) {
 				return prev;
 			}
 			return [...prev, raw];
@@ -62,32 +81,112 @@ export function App() {
 				case "":
 					return "";
 				case "help":
-					return "available commands:\n\necho\nclear\npwd\ncd\nsay\npbcopy\npbpaste\ncurl";
+					return "available commands:\n\nhelp\necho\nclear\nhistory\nhead\ntail\npwd\nls\ncd\nmkdir\ntouch\nrm\ncat\nsay\npbcopy\npbpaste\ncurl";
 				case "echo":
 					return stdin || args.join(" ");
 				case "clear":
 					setMemory([]);
 					return "";
+				case "history":
+					return inputMemory
+						.map((e, i) => (i + 1).toString().padEnd(inputMemory.length.toString().length) + "  " + e)
+						.join("\n");
+				case "head":
+					const headContent = stdin;
+					let headLineCount = 0;
+					for (let i = 0; i < headContent.length; i++) {
+						if (headContent[i] === "\n") {
+							headLineCount++;
+						}
+						if (headLineCount >= 10) {
+							return headContent.slice(0, i);
+						}
+					}
+					return headContent;
+				case "tail":
+					const tailContent = stdin;
+					let tailLineCount = 0;
+					for (let i = tailContent.length - 1; i >= 0; i--) {
+						if (tailContent[i] === "\n") {
+							tailLineCount++;
+						}
+						if (tailLineCount >= 10) {
+							return tailContent.slice(i + 1);
+						}
+					}
+					return tailContent;
 				case "pwd":
 					return window.location.pathname;
+				case "ls":
+					return Object.values(workingDirectory.contents)
+						.map((e) => e.name)
+						.join("\n");
 				case "cd":
-					const path = args.length === 0 ? "/" : args[0];
+					const path = args.length === 0 ? ROOT_DIR : stdin || args[0];
+					const endPath = walkFS(fileSystemRef.current, window.location.pathname, path)[1];
 					const url = new URL(window.location.href);
-					if (path.startsWith("/")) {
-						url.pathname = path;
-					} else {
-						const sep = url.pathname.endsWith("/") ? "" : "/";
-						url.pathname += sep + path;
-					}
+					url.pathname = endPath;
 					history.pushState(null, "", url);
 					return "";
+				case "mkdir":
+					const dirName = stdin || args[0];
+					if (!dirName) {
+						throw new Error("name is required");
+					}
+					// TODO needs to combine paths
+					if (dirName in workingDirectory.contents) {
+						throw new Error(dirName + ": exists");
+					}
+					const createdDir = newDirectory(dirName);
+					workingDirectory.contents[dirName] = createdDir;
+					writeToDisk(fileSystemRef.current);
+					return "";
+				case "touch":
+					const fileName = stdin || args[0];
+					if (!fileName) {
+						throw new Error("name is required");
+					}
+					// TODO needs to combine paths
+					if (fileName in workingDirectory.contents) {
+						return "";
+					}
+					const createdFile = newFile(fileName);
+					workingDirectory.contents[fileName] = createdFile;
+					writeToDisk(fileSystemRef.current);
+					return "";
+				case "rm":
+					const isRecursive = args[0] === "-r";
+					const rmName = stdin || (isRecursive ? args[1] : args[0]);
+					if (!rmName) {
+						throw new Error("name is required");
+					}
+					const rmTarget = workingDirectory.contents[rmName]; // TODO needs to combine paths
+					if (!rmTarget) {
+						throw new Error(rmName + ": No such file or directory");
+					}
+					if (!isRecursive && isDirectory(rmTarget)) {
+						throw new Error(rmName + ": is a directory");
+					}
+					delete workingDirectory.contents[rmName];
+					writeToDisk(fileSystemRef.current);
+					return "";
+				case "cat":
+					const catFileName = stdin || args[0];
+					const file = workingDirectory.contents[catFileName]; // TODO needs to combine paths
+					if (!file) {
+						throw new Error("not found");
+					}
+					if (!isFile(file)) {
+						throw new Error("not a file: " + catFileName);
+					}
+					return file.content;
 				case "say":
 					const text = stdin || args.join(" ");
 					const utterance = new SpeechSynthesisUtterance(text);
 					window.speechSynthesis.speak(utterance);
 					return "";
 				case "pbcopy":
-					navigator.clipboard.writeText(stdin);
+					await navigator.clipboard.writeText(stdin);
 					return "";
 				case "pbpaste":
 					return navigator.clipboard.readText();
@@ -188,4 +287,9 @@ function InputArea({ onRun, inputMemory, isReady }: InputAreaProps) {
 
 function Prompt() {
 	return <div className="terminal__prompt">$:</div>;
+}
+
+function useLazyRef<T>(initial: T | (() => T)) {
+	const [initialValue] = React.useState(initial);
+	return React.useRef(initialValue);
 }
